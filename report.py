@@ -67,27 +67,14 @@ def parse_date_arg(arg):
 
 
 def load_screenshots(date_str):
-    """加载截图，同时读取次日 04:00 前的截图（解决跨天「午夜断层」）。"""
-    target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-
-    # 当天截图
+    """加载截图（collect.py 已按 04:00 日界分文件夹，直接读即可）。"""
     folder = os.path.join(SCREENSHOT_DIR, date_str)
-    files = []
-    if os.path.isdir(folder):
-        files = sorted(
-            os.path.join(folder, f)
-            for f in os.listdir(folder) if f.endswith(".jpg")
-        )
-
-    # 跨天：读取次日 04:00 前的截图归到当天
-    next_day = target_date + timedelta(days=1)
-    next_folder = os.path.join(SCREENSHOT_DIR, next_day.isoformat())
-    if os.path.isdir(next_folder):
-        for f in sorted(os.listdir(next_folder)):
-            if f.endswith(".jpg") and f < "04-00-00":
-                files.append(os.path.join(next_folder, f))
-
-    return files
+    if not os.path.isdir(folder):
+        return []
+    return sorted(
+        os.path.join(folder, f)
+        for f in os.listdir(folder) if f.endswith(".jpg")
+    )
 
 
 def dhash(img, hash_size=8):
@@ -316,9 +303,16 @@ def batch_analyze(paths, config, date_str, verbose=True):
 # =====================================================================
 
 def _dt_from_path(path, time_str):
-    """从截图路径提取完整日期 + 时间（解决跨午夜时间计算）。"""
+    """从截图路径还原真实时间。
+
+    collect.py 建文件夹时用了 (真实时间 - 4h)，所以文件夹名比真实日期偏早。
+    这里先解析出 session 时间，如果小时 < 4 说明被偏移吞了一天，加回来。
+    """
     folder = os.path.basename(os.path.dirname(path))
-    return datetime.strptime(f"{folder} {time_str}", "%Y-%m-%d %H-%M-%S")
+    dt = datetime.strptime(f"{folder} {time_str}", "%Y-%m-%d %H-%M-%S")
+    if dt.hour < 4:
+        dt += timedelta(days=1)
+    return dt
 
 
 def merge_sessions(analyses):
@@ -623,7 +617,7 @@ def save_to_db(date_str, sessions, stats, commentary):
 
 
 # =====================================================================
-#  删除截图 + 数据清理
+#  删除截图
 # =====================================================================
 
 def ask_delete(date_str):
@@ -644,19 +638,6 @@ def ask_delete(date_str):
                 print(f"已删除分析缓存")
             except Exception as e:
                 print(f"删除缓存文件失败: {e}")
-
-        # 清理数据库中的明细数据（隐私保护）
-        try:
-            conn = sqlite3.connect(DATABASE_PATH)
-            conn.execute(
-                "UPDATE daily_sessions SET detail='', tags='[]' WHERE date=?",
-                (date_str,)
-            )
-            conn.commit()
-            conn.close()
-            print(f"已清理数据库中的明细数据（detail/tags 已清空）")
-        except Exception as e:
-            print(f"清理数据库失败: {e}")
 
 
 def clean_old_caches():

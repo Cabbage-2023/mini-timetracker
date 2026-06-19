@@ -98,7 +98,9 @@ try:
 
         if last_hash is None or hamming(h, last_hash) > 3:
             t = datetime.now()
-            folder = os.path.join(DIR, t.strftime("%Y-%m-%d"))
+            # 凌晨 04:00 前算前一天（日界为 04:00）
+            session_key = (t - timedelta(hours=4)).strftime("%Y-%m-%d")
+            folder = os.path.join(DIR, session_key)
             os.makedirs(folder, exist_ok=True)
             img.save(
                 os.path.join(folder, t.strftime("%H-%M-%S.jpg")),

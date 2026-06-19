@@ -11,3 +11,6 @@ __pycache__/
 *.pyo
 .env
 .venv/
+
+# Other tools
+.deepeval/
