@@ -8,5 +8,6 @@
     "api_key": "sk-你的API Key",
     "base_url": "https://api.deepseek.com",
     "model": "deepseek-chat",
-    "sample_rate": 1
+    "sample_rate": 1,
+    "keep_days": 7
 }
