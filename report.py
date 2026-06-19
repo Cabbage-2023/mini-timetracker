@@ -192,8 +192,11 @@ def _cache_path(ds):
 def load_cache(ds):
     p = _cache_path(ds)
     if os.path.exists(p):
-        with open(p, encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(p, encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass  # 缓存损坏就当不存在，重新分析
     return {}
 
 
@@ -296,12 +299,16 @@ def batch_analyze(paths, config, date_str, verbose=True):
         for _, path in uncached:
             b64_cache[path] = encode_image(path)
 
-        # 每线程独立 client（httpx 连接池非线程安全）
-        clients = [
-            OpenAI(api_key=config["api_key"],
-                   base_url=config.get("base_url"), timeout=60)
-            for _ in range(max_workers)
-        ]
+        # 每线程独立 client（httpx 连接池非线程安全，用 threading.local）
+        thread_local = threading.local()
+
+        def _get_client():
+            if not hasattr(thread_local, "client"):
+                thread_local.client = OpenAI(
+                    api_key=config["api_key"],
+                    base_url=config.get("base_url"), timeout=60
+                )
+            return thread_local.client
 
         lock = threading.Lock()
         completed = 0
@@ -309,7 +316,7 @@ def batch_analyze(paths, config, date_str, verbose=True):
         def analyze_one(idx, path):
             nonlocal completed
             ts = os.path.basename(path).replace(".jpg", "")
-            r = analyze_screenshot(clients[idx % max_workers], model, path,
+            r = analyze_screenshot(_get_client(), model, path,
                                    b64_cache.get(path))
             r["time"] = ts
             r["path"] = path
@@ -317,8 +324,9 @@ def batch_analyze(paths, config, date_str, verbose=True):
                 cache[path] = r
                 completed += 1
                 do_save = (completed % 20 == 0)
-            if do_save:
-                save_cache(date_str, cache)
+                if do_save:
+                    # 在锁内快照 → 锁外写盘，避免 json.dump 遍历时 dict 被并发修改
+                    save_cache(date_str, dict(cache))
             return idx, r
 
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -658,7 +666,11 @@ def save_to_db(date_str, sessions, stats, commentary):
 # =====================================================================
 
 def ask_delete(date_str):
-    ans = input("\n确认日报无误，可以删除今日截图？(y/n): ").strip().lower()
+    try:
+        ans = input("\n确认日报无误，可以删除今日截图？(y/n): ").strip().lower()
+    except (EOFError, OSError):
+        print("非交互式运行，跳过删除截图。")
+        return
     if ans == "y":
         folder = os.path.join(SCREENSHOT_DIR, date_str)
         try:
