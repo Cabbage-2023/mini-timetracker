@@ -1,0 +1,13 @@
+# User data
+screenshots/
+reports/
+
+# API keys
+config.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv/
