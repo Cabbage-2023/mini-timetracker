@@ -253,6 +253,7 @@ def batch_analyze(paths, config, date_str, verbose=True):
         if path in cache:
             r = dict(cache[path])   # shallow copy → 不污染缓存对象
             r["time"] = ts
+            r["path"] = path        # 旧缓存可能没有 path，必须补上
             results[i] = r
             if verbose:
                 print(f"  [{i+1}/{len(sampled)}] {ts} -> (缓存) {r['activity']}")

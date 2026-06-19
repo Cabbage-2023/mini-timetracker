@@ -8,7 +8,7 @@ collect.py — 后台截图采集
       按 Ctrl+C 停止
 """
 
-import os, time, json, shutil
+import os, time, json, shutil, threading, queue
 from datetime import datetime, timedelta
 from PIL import ImageGrab
 
@@ -53,16 +53,38 @@ def hamming(h1, h2):
 
 
 def get_screen():
-    """截图并返回 (dHash, Image对象)。锁屏/UAC 时返回 (None, None)。"""
-    try:
-        img = ImageGrab.grab()
-    except OSError as e:
-        print(f"   ⚠ 截图失败 (可能锁屏/UAC): {e}")
-        print(f"     将在 5 秒后重试...")
+    """截图并返回 (dHash, Image对象)。失败/超时/空帧时返回 (None, None)。"""
+    q = queue.Queue()
+
+    def _grab():
+        try:
+            q.put(ImageGrab.grab())
+        except Exception as e:
+            q.put(e)
+
+    t = threading.Thread(target=_grab, daemon=True)
+    t.start()
+    t.join(15)  # 最多等 15 秒（防 ImageGrab 死锁）
+    if t.is_alive():
+        print("   ⚠ 截图超时 (ImageGrab 无响应)")
         time.sleep(5)
         return None, None
-    h = dhash(img)
-    return h, img
+    try:
+        result = q.get_nowait()
+    except queue.Empty:
+        print("   ⚠ 截图线程异常退出")
+        time.sleep(5)
+        return None, None
+    if isinstance(result, Exception):
+        print(f"   ⚠ 截图失败: {result}")
+        time.sleep(5)
+        return None, None
+    if result is None:
+        print("   ⚠ 截图返回空 (可能无显示器)")
+        time.sleep(5)
+        return None, None
+    h = dhash(result)
+    return h, result
 
 
 def cleanup():
