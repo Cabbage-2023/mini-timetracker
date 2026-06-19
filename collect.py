@@ -58,6 +58,8 @@ def get_screen():
         img = ImageGrab.grab()
     except OSError as e:
         print(f"   ⚠ 截图失败 (可能锁屏/UAC): {e}")
+        print(f"     将在 5 秒后重试...")
+        time.sleep(5)
         return None, None
     h = dhash(img)
     return h, img

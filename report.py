@@ -319,6 +319,12 @@ def merge_sessions(analyses):
     if not analyses:
         return []
 
+    # 先还原每张图的真实物理时间
+    for a in analyses:
+        a["_dt"] = _dt_from_path(a.get("path", ""), a["time"])
+    # 🔥 按真实物理时间排序（文件名排序跨午夜会错乱：00:01 < 23:59）
+    analyses.sort(key=lambda x: x["_dt"])
+
     sessions = []
     cur = None
 
@@ -335,8 +341,6 @@ def merge_sessions(analyses):
         }
 
     for a in analyses:
-        a["_dt"] = _dt_from_path(a.get("path", ""), a["time"])
-
         if cur is None:
             cur = fresh(a)
             cur["apps"].add(a["app"])
