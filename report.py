@@ -54,6 +54,20 @@ def load_config():
     return cfg
 
 
+def _make_client(config, timeout=60):
+    """创建 OpenAI client，自动处理代理。"""
+    import httpx
+    kwargs = dict(
+        api_key=config["api_key"],
+        base_url=config.get("base_url"),
+        timeout=timeout,
+    )
+    proxy = config.get("proxy", "")
+    if proxy:
+        kwargs["http_client"] = httpx.Client(proxy=proxy)
+    return OpenAI(**kwargs)
+
+
 def parse_date_arg(arg):
     if not arg:
         return date.today()
@@ -175,9 +189,16 @@ def extract_json(text):
 
 
 def fallback_result(err):
+    detail = str(err)
+    # 451 / censorship = 内容审核拦截（R18 被屏蔽）
+    if "451" in detail or "censorship" in detail.lower():
+        return {
+            "app": "unknown", "activity": "可能是在搞黄色吧",
+            "detail": "（内容被审核拦截）", "tags": [], "activity_type": "娱乐"
+        }
     return {
         "app": "unknown", "activity": "分析失败",
-        "detail": str(err), "tags": [], "activity_type": "其他"
+        "detail": detail, "tags": [], "activity_type": "其他"
     }
 
 
@@ -229,7 +250,7 @@ def analyze_screenshot(client, model, image_path, b64=None):
         return fallback_result("图片编码失败（文件可能损坏）")
     for attempt in range(2):
         try:
-            kwargs = dict(
+            resp = client.chat.completions.create(
                 model=model,
                 messages=[{
                     "role": "user",
@@ -240,16 +261,12 @@ def analyze_screenshot(client, model, image_path, b64=None):
                     ]
                 }],
                 temperature=0.1,
-                max_tokens=256,
+                max_tokens=512,
             )
-            # 首次请求使用 json_object 模式（准确率更高）
-            if attempt == 0:
-                kwargs["response_format"] = {"type": "json_object"}
-            resp = client.chat.completions.create(**kwargs)
             result = extract_json(resp.choices[0].message.content)
             if result is None:
                 if attempt == 0:
-                    continue  # 重试一次，不用 json_object
+                    continue
                 return fallback_result("回复不是合法JSON")
             result.setdefault("app", "unknown")
             result.setdefault("activity", "未知")
@@ -259,7 +276,7 @@ def analyze_screenshot(client, model, image_path, b64=None):
             return result
         except Exception as e:
             if attempt == 0:
-                time.sleep(2)  # 指数退避：等 2 秒再重试
+                time.sleep(2)
                 continue
             return fallback_result(e)
 
@@ -304,10 +321,7 @@ def batch_analyze(paths, config, date_str, verbose=True):
 
         def _get_client():
             if not hasattr(thread_local, "client"):
-                thread_local.client = OpenAI(
-                    api_key=config["api_key"],
-                    base_url=config.get("base_url"), timeout=60
-                )
+                thread_local.client = _make_client(config, timeout=60)
             return thread_local.client
 
         lock = threading.Lock()
@@ -327,6 +341,12 @@ def batch_analyze(paths, config, date_str, verbose=True):
                 if do_save:
                     # 在锁内快照 → 锁外写盘，避免 json.dump 遍历时 dict 被并发修改
                     save_cache(date_str, dict(cache))
+            if verbose:
+                act = r.get("activity", "?")
+                detail = r.get("detail", "")
+                print(f"  [{completed}/{len(uncached)}] {ts} -> {act}")
+                if "失败" in act or "受限" in act or "搞黄色" in act:
+                    print(f"          [!] {detail[:120]}")
             return idx, r
 
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -516,8 +536,7 @@ def generate_chart(stats, output_path):
 # =====================================================================
 
 def generate_commentary(sessions, config):
-    client = OpenAI(api_key=config["api_key"],
-                    base_url=config.get("base_url"), timeout=30)
+    client = _make_client(config, timeout=30)
     model = config.get("model", "gpt-4o-mini")
 
     timeline = ["今日活动时间线："]
@@ -526,15 +545,18 @@ def generate_commentary(sessions, config):
         timeline.append(f"- {s['start']}~{s['end']}（{fmt_dur(dur)}）{s['activity']}")
 
     prompt = (
-        "以下是我今天的时间线，给一段幽默的每日点评。\n"
-        "不要装正经，像朋友聊天一样自然。200字以内。\n\n"
-        + "\n".join(timeline) + "\n\n点评："
+        "以下是我今天的时间线。请按以下格式点评：\n\n"
+        "【今日定性】一句话总结今天是什么日子（摸鱼日/学习日/工作日/搞黄色日/混合日等）\n"
+        "【各项评分】根据今天的主要内容给出2-3个合适的维度打分（X/10），每个评分跟一句简短理由。"
+        "比如摸鱼日→娱乐指数、专注指数、手速指数；学习日→学习效率、专注度；搞黄色日→你自由发挥\n"
+        "【一言蔽之】一段幽默总结，朋友聊天语气，100字以内，可以损一点\n\n"
+        + "\n".join(timeline) + "\n\n开始点评："
     )
 
     try:
         resp = client.chat.completions.create(
             model=model, messages=[{"role": "user", "content": prompt}],
-            temperature=0.8, max_tokens=300
+            temperature=0.9, max_tokens=500
         )
         return resp.choices[0].message.content.strip()
     except Exception as e:
@@ -558,21 +580,37 @@ def write_report(date_str, sessions, stats, chart_rel, commentary):
         lines.append(f"![]({chart_rel})\n")
 
     lines.append("---\n## 时间线\n")
-    lines.append("| 时间段 | 活动 | 应用 | 时长 |")
-    lines.append("|--------|------|------|------|")
+    lines.append("| 时间段 | 活动 | 应用 | 时长 |\n")
+    lines.append("|--------|------|------|------|\n")
     for s in sessions:
         dur = s["duration_seconds"]
-        e = emoji.get(s["activity_type"], "> ")
+        e = emoji.get(s["activity_type"], "📌")
+        st = s["start"].replace("-", ":")
+        en = s["end"].replace("-", ":")
         lines.append(
-            f"| {s['start']}~{s['end']} | {e} {s['activity']} "
-            f"| {s['app'][:24]} | {fmt_dur(dur)} |"
+            f"| {st}~{en} | {e} {s['activity']} "
+            f"| {s['app'][:24]} | {fmt_dur(dur)} |\n"
         )
 
-    lines.append("\n---\n## 统计\n")
+    lines.append("\n---\n## 详细时间轴\n")
+    for s in sessions:
+        st = s["start"].replace("-", ":")
+        en = s["end"].replace("-", ":")
+        e = emoji.get(s["activity_type"], "📌")
+        label = f"{e} {s['activity_type']}"
+        lines.append(f"**{st} ~ {en} — {label}**\n\n")
+        detail = s.get("detail", "").strip()
+        if detail:
+            lines.append(f"> {detail}\n\n")
+        else:
+            lines.append("> （无详细记录）\n\n")
+
+    lines.append("---\n## 统计\n")
     lines.append(f"- 分析有效截图：{stats['total_shots']} 张\n")
     lines.append("**活动类型占比：**\n")
     for at, pct in stats.get("activity_type_pct", {}).items():
-        bar = "|" * max(int(pct / 4), 1)
+        blocks = max(int(pct / 10), 1)
+        bar = "█" * blocks + "░" * (10 - blocks)
         lines.append(f"- {at}: {bar} {pct}%\n")
     lines.append("\n**高频标签：**\n")
     for tag, cnt in list(stats.get("top_tags", {}).items())[:10]:
@@ -754,7 +792,12 @@ def main():
     with open(report_path, encoding="utf-8") as f:
         content = f.read()
     print("\n" + "=" * 56)
-    print(content[:2500] + ("\n...(截断)" if len(content) > 2500 else ""))
+    try:
+        print(content[:2500] + ("\n...(截断)" if len(content) > 2500 else ""))
+    except UnicodeEncodeError:
+        # Windows GBK 终端不认 emoji → 替换为 ?
+        safe = content[:2500].encode("gbk", errors="replace").decode("gbk")
+        print(safe + ("\n...(截断)" if len(content) > 2500 else ""))
     print("=" * 56)
 
     ask_delete(ds)

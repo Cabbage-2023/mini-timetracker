@@ -39,23 +39,22 @@ pip install -U pillow openai matplotlib
 
 ```json
 {
-    "api_key": "sk-你的Key",
-    "base_url": "https://api.deepseek.com",
-    "model": "deepseek-chat"
+    "api_key": "你的Key",
+    "base_url": "https://api.stepfun.com/v1",
+    "model": "step-1o-turbo-vision",
+    "proxy": "http://127.0.0.1:7890"
 }
 ```
 
-随便选一家：
+推荐服务：
 
-| 服务 | base_url | model | 月费 |
-|------|----------|-------|------|
-| **DeepSeek** 👑 | `https://api.deepseek.com` | `deepseek-chat` | ~3元 |
-| **智谱 GLM-4V-Flash** | `https://open.bigmodel.cn/api/paas/v4` | `glm-4v-flash` | 免费 |
-| **OpenAI** | `https://api.openai.com/v1` | `gpt-4o-mini` | ~$3 |
+| 服务 | base_url | model | 月费 | 备注 |
+|------|----------|-------|------|------|
+| **阶跃星辰** 👑 | `https://api.stepfun.com/v1` | `step-1o-turbo-vision` | ~3元 | 识图强，速度快 |
+| **DeepSeek** | `https://api.deepseek.com` | `deepseek-chat` | ~3元 | 纯文本，不识图 |
+| **智谱 GLM-4V-Flash** | `https://open.bigmodel.cn/api/paas/v4` | `glm-4v-flash` | 免费 | 识图免费，有内容审核 |
 
-> DeepSeek 对成人内容最宽松，智谱免费但可能过滤 NSFW，GPT-4o 费用最高。
->
-> 如果你发现 DeepSeek 经常认错截图里的文字，换成智谱 GLM-4V-Flash 试试。
+> 阶跃星辰的服务器可能在境外，部分网络环境需要开代理。在 `config.json` 中设置 `proxy` 即可，代码会自动走代理。
 
 ### 3. 采集
 
@@ -104,15 +103,35 @@ python report.py 2026-06-19    # 指定日期
 | 15:00～15:30 | 💬 在和 AI 聊性癖 | DeepSeek | 30m |
 ```
 
+### 详细时间轴
+
+每段活动展开 LLM 识别的详细描述：
+
+```
+**09:02～10:30 — 💬 社交**
+> 用户在 WeChat 上与 gal 群群友聊天，话题包括考研焦虑、游戏推荐等，
+> 期间穿插了分享短视频链接。
+
+**10:30～10:45 — 🎮 娱乐**
+> 在 B 站观看 up 主的抽象游戏视频，视频内容为搞笑的游戏bug合集。
+```
+
 ### 统计图表
 
 饼图（活动类型分布）+ 条形图（应用排行），自动保存在日报同目录。
+活动类型占比也会以文字形式写入日报，如 `娱乐: ████████░░ 80.0%`。
 
 ### AI 点评
 
-每次生成一段幽默的每日总结。比如：
+每次生成结构化多维度点评：
 
-> 上午摸鱼水准不错，gal 群聊出了 KPI 感。下午突然切到 VSCode 编程——疑似良心发现。睡前和 AI 的深层交流保持了稳定产出。建议明天把 X 搜索时间控制在 20 分钟内（虽然你不会听的）。
+```
+【今日定性】摸鱼日
+【娱乐指数】8/10 — 上午群聊不亦乐乎，B站摸鱼紧随其后
+【专注指数】3/10 — 唯一的工作时段仅持续30分钟，属于良心发现型
+【一言蔽之】今天这个效率，上午gal群聊出了KPI感，下午突然切VSCode疑似良心发现，
+睡前保持了稳定的深层交流。建议明天把施法时间控制在20分钟内——虽然你不会听的。
+```
 
 ---
 
@@ -164,12 +183,13 @@ print(r[0] if r else '无')
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
 | `api_key` | — | API Key |
-| `base_url` | `https://api.deepseek.com` | API 地址 |
-| `model` | `deepseek-chat` | 模型名 |
+| `base_url` | `https://api.stepfun.com/v1` | API 地址 |
+| `model` | `step-1o-turbo-vision` | 模型名 |
 | `sample_rate` | `1` | 分析采样率。`1`=全部分析，`2`=隔一张分析一张 |
 | `analysis_threads` | `5` | LLM 分析并发线程数。截图多时可以调大 |
 | `keep_days` | `7` | 截图保留天数。过期自动清理 |
 | `screenshot_interval` | `30` | 截图间隔（秒） |
+| `proxy` | `""` | HTTP 代理地址。部分网络需要梯子时填，如 `http://127.0.0.1:7890` |
 
 ---
 
@@ -223,3 +243,4 @@ mini-timetracker/
 - **没有手机端**
 - **LLM 分析需要联网**
 - 截图多的时候分析可能要几分钟（并发 5 线程，去重后几百张 ≈ 1-3 分钟）
+- **Git Bash 下 Python 的 httpx 访问某些境外 API 可能因 SSL 问题失败**，如在 Git Bash 运行遇到 `Connection error`，请设置代理：在 `config.json` 中填 `proxy` 字段，或在终端执行 `export HTTPS_PROXY=http://127.0.0.1:7890`

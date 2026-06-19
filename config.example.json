@@ -1,13 +1,16 @@
 {
     "_note": "复制此文件为 config.json 并填入你的 API Key",
     "_examples": {
-        "deepseek":   { "api_key": "sk-xxx", "base_url": "https://api.deepseek.com",          "model": "deepseek-chat" },
-        "zhipu_glm":  { "api_key": "xxx",    "base_url": "https://open.bigmodel.cn/api/paas/v4", "model": "glm-4v-flash" },
-        "openai":     { "api_key": "sk-xxx", "base_url": "https://api.openai.com/v1",           "model": "gpt-4o-mini" }
+        "stepfun":    { "api_key": "你的Key", "base_url": "https://api.stepfun.com/v1",          "model": "step-1o-turbo-vision" },
+        "deepseek":   { "api_key": "sk-xxx",  "base_url": "https://api.deepseek.com",             "model": "deepseek-chat" },
+        "zhipu_glm":  { "api_key": "xxx",     "base_url": "https://open.bigmodel.cn/api/paas/v4", "model": "glm-4v-flash" }
     },
-    "api_key": "sk-你的API Key",
-    "base_url": "https://api.deepseek.com",
-    "model": "deepseek-chat",
+    "api_key": "你的API Key",
+    "base_url": "https://api.stepfun.com/v1",
+    "model": "step-1o-turbo-vision",
+    "proxy": "http://127.0.0.1:7890",
     "sample_rate": 1,
-    "keep_days": 7
+    "analysis_threads": 5,
+    "keep_days": 7,
+    "screenshot_interval": 30
 }
