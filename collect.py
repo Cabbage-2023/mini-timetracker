@@ -21,7 +21,7 @@ INTERVAL = 30
 KEEP_DAYS = 7
 
 if os.path.exists(CONFIG_PATH):
-    with open(CONFIG_PATH) as f:
+    with open(CONFIG_PATH, encoding="utf-8") as f:
         cfg = json.load(f)
         INTERVAL = cfg.get("screenshot_interval", 30)
         KEEP_DAYS = cfg.get("keep_days", 7)

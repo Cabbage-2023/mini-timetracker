@@ -43,9 +43,12 @@ def load_config():
         print(f"xxx 找不到 {CONFIG_PATH}")
         print(f"   请复制 config.json 并填入你的 API Key")
         sys.exit(1)
-    with open(CONFIG_PATH) as f:
+    with open(CONFIG_PATH, encoding="utf-8") as f:
         cfg = json.load(f)
-    if "sk-在这里填" in cfg.get("api_key", ""):
+    if "api_key" not in cfg or not cfg["api_key"]:
+        print("xxx config.json 中缺少 api_key 或为空")
+        sys.exit(1)
+    if "sk-在这里填" in cfg["api_key"]:
         print("xxx 请先在 config.json 中填入你的 API Key")
         sys.exit(1)
     return cfg
@@ -96,31 +99,50 @@ def hamming(h1, h2):
 
 
 def image_hash(path):
-    with Image.open(path) as img:
-        return dhash(img)
+    """dHash 计算，损坏图片返回 None。"""
+    try:
+        with Image.open(path) as img:
+            return dhash(img)
+    except Exception:
+        return None
 
 
 def dedup(paths):
-    """dHash 去重，汉明距离 ≤ 3 视为同一画面。"""
+    """dHash 去重，汉明距离 ≤ 3 视为同一画面。损坏图片自动跳过。"""
     if not paths:
         return []
-    result = [paths[0]]
-    last_h = image_hash(paths[0])
-    for p in paths[1:]:
+    result = []
+    last_h = None
+    for p in paths:
         h = image_hash(p)
-        if hamming(h, last_h) > 3:
+        if h is None:
+            continue  # 跳过损坏/不可读的截图
+        if last_h is None or hamming(h, last_h) > 3:
             result.append(p)
             last_h = h
     return result
 
 
 def encode_image(path, max_size=2048):
-    with Image.open(path) as img:
-        if img.width > max_size or img.height > max_size:
-            img.thumbnail((max_size, max_size), Image.LANCZOS)
+    """编码为 base64。尺寸合适时直接传原始字节，避免二次压缩损失画质。"""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except Exception:
+        return ""
+    try:
+        img = Image.open(io.BytesIO(raw))
+        if img.width <= max_size and img.height <= max_size:
+            # 原始尺寸 → 直接传，避免 decode→reencode 画质损失
+            return base64.b64encode(raw).decode()
+        # 超尺寸 → 缩略后编码
+        img.thumbnail((max_size, max_size), Image.LANCZOS)
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=85)
         return base64.b64encode(buf.getvalue()).decode()
+    except Exception as e:
+        print(f"   ⚠ 图片编码失败: {os.path.basename(path)} - {e}")
+        return ""
 
 
 def fmt_dur(seconds):
@@ -196,8 +218,12 @@ ANALYSIS_PROMPT = """分析这张截图，用户在干什么？
 }"""
 
 
-def analyze_screenshot(client, model, image_path):
-    b64 = encode_image(image_path)
+def analyze_screenshot(client, model, image_path, b64=None):
+    """分析一张截图。b64 可预传入避免重复编码。"""
+    if b64 is None:
+        b64 = encode_image(image_path)
+    if not b64:
+        return fallback_result("图片编码失败（文件可能损坏）")
     for attempt in range(2):
         try:
             kwargs = dict(
@@ -230,7 +256,8 @@ def analyze_screenshot(client, model, image_path):
             return result
         except Exception as e:
             if attempt == 0:
-                continue  # 重试一次
+                time.sleep(2)  # 指数退避：等 2 秒再重试
+                continue
             return fallback_result(e)
 
 
@@ -264,6 +291,11 @@ def batch_analyze(paths, config, date_str, verbose=True):
         print(f"   需分析 {len(uncached)} 张，并发 {max_workers} 线程")
 
     if uncached:
+        # 预计算所有截图的 base64（避免每线程重复 encode，CPU-bound）
+        b64_cache = {}
+        for _, path in uncached:
+            b64_cache[path] = encode_image(path)
+
         # 每线程独立 client（httpx 连接池非线程安全）
         clients = [
             OpenAI(api_key=config["api_key"],
@@ -277,16 +309,16 @@ def batch_analyze(paths, config, date_str, verbose=True):
         def analyze_one(idx, path):
             nonlocal completed
             ts = os.path.basename(path).replace(".jpg", "")
-            r = analyze_screenshot(clients[idx % max_workers], model, path)
+            r = analyze_screenshot(clients[idx % max_workers], model, path,
+                                   b64_cache.get(path))
             r["time"] = ts
             r["path"] = path
             with lock:
                 cache[path] = r
                 completed += 1
-                if verbose:
-                    print(f"  [{completed}/{len(uncached)}] {ts} -> {r['activity']}")
-                if completed % 20 == 0:
-                    save_cache(date_str, cache)
+                do_save = (completed % 20 == 0)
+            if do_save:
+                save_cache(date_str, cache)
             return idx, r
 
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
