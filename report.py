@@ -12,8 +12,9 @@ report.py — 日报生成器
 
 import os, sys, json, base64, shutil, re, time, io, sqlite3
 from datetime import datetime, date, timedelta
-from hashlib import md5
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 from PIL import Image
 from openai import OpenAI
@@ -25,12 +26,12 @@ import matplotlib.pyplot as plt
 # =====================================================================
 #  配置
 # =====================================================================
-CONFIG_PATH    = "config.json"
-SCREENSHOT_DIR = "screenshots"
-REPORT_DIR     = "reports"
+BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH    = os.path.join(BASE_DIR, "config.json")
+SCREENSHOT_DIR = os.path.join(BASE_DIR, "screenshots")
+REPORT_DIR     = os.path.join(BASE_DIR, "reports")
 DATABASE_PATH  = os.path.join(REPORT_DIR, "data.db")
-API_DELAY      = 0.3
-GAP_MINUTES    = 5
+GAP_MINUTES    = 120       # 同类型活动间隔 < 2h 合并（避免静止画面误断开）
 
 
 # =====================================================================
@@ -66,27 +67,61 @@ def parse_date_arg(arg):
 
 
 def load_screenshots(date_str):
+    """加载截图，同时读取次日 04:00 前的截图（解决跨天「午夜断层」）。"""
+    target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+
+    # 当天截图
     folder = os.path.join(SCREENSHOT_DIR, date_str)
-    if not os.path.isdir(folder):
-        return []
-    files = sorted(f for f in os.listdir(folder) if f.endswith(".jpg"))
-    return [os.path.join(folder, f) for f in files]
+    files = []
+    if os.path.isdir(folder):
+        files = sorted(
+            os.path.join(folder, f)
+            for f in os.listdir(folder) if f.endswith(".jpg")
+        )
+
+    # 跨天：读取次日 04:00 前的截图归到当天
+    next_day = target_date + timedelta(days=1)
+    next_folder = os.path.join(SCREENSHOT_DIR, next_day.isoformat())
+    if os.path.isdir(next_folder):
+        for f in sorted(os.listdir(next_folder)):
+            if f.endswith(".jpg") and f < "04-00-00":
+                files.append(os.path.join(next_folder, f))
+
+    return files
+
+
+def dhash(img, hash_size=8):
+    """dHash（差异哈希），64-bit 整数。"""
+    gray = img.convert("L")
+    resized = gray.resize((hash_size + 1, hash_size))
+    h = 0
+    for y in range(hash_size):
+        for x in range(hash_size):
+            h <<= 1
+            if resized.getpixel((x, y)) > resized.getpixel((x + 1, y)):
+                h |= 1
+    return h
+
+
+def hamming(h1, h2):
+    """汉明距离：两个 dHash 相差的位数。"""
+    return bin(h1 ^ h2).count("1")
 
 
 def image_hash(path):
     with Image.open(path) as img:
-        img.thumbnail((16, 16))
-        return md5(img.tobytes()).hexdigest()
+        return dhash(img)
 
 
 def dedup(paths):
+    """dHash 去重，汉明距离 ≤ 3 视为同一画面。"""
     if not paths:
         return []
     result = [paths[0]]
     last_h = image_hash(paths[0])
     for p in paths[1:]:
         h = image_hash(p)
-        if h != last_h:
+        if hamming(h, last_h) > 3:
             result.append(p)
             last_h = h
     return result
@@ -176,74 +211,101 @@ ANALYSIS_PROMPT = """分析这张截图，用户在干什么？
 
 def analyze_screenshot(client, model, image_path):
     b64 = encode_image(image_path)
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": ANALYSIS_PROMPT},
-                    {"type": "image_url",
-                     "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-                ]
-            }],
-            temperature=0.1,
-            max_tokens=256
-        )
-        result = extract_json(resp.choices[0].message.content)
-        if result is None:
-            return fallback_result("回复不是合法JSON")
-        result.setdefault("app", "unknown")
-        result.setdefault("activity", "未知")
-        result.setdefault("detail", "")
-        result.setdefault("tags", [])
-        result.setdefault("activity_type", "其他")
-        return result
-    except Exception as e:
-        return fallback_result(e)
+    for attempt in range(2):
+        try:
+            kwargs = dict(
+                model=model,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": ANALYSIS_PROMPT},
+                        {"type": "image_url",
+                         "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                    ]
+                }],
+                temperature=0.1,
+                max_tokens=256,
+            )
+            # 首次请求使用 json_object 模式（准确率更高）
+            if attempt == 0:
+                kwargs["response_format"] = {"type": "json_object"}
+            resp = client.chat.completions.create(**kwargs)
+            result = extract_json(resp.choices[0].message.content)
+            if result is None:
+                if attempt == 0:
+                    continue  # 重试一次，不用 json_object
+                return fallback_result("回复不是合法JSON")
+            result.setdefault("app", "unknown")
+            result.setdefault("activity", "未知")
+            result.setdefault("detail", "")
+            result.setdefault("tags", [])
+            result.setdefault("activity_type", "其他")
+            return result
+        except Exception as e:
+            if attempt == 0:
+                continue  # 重试一次
+            return fallback_result(e)
 
 
 def batch_analyze(paths, config, date_str, verbose=True):
+    """并发分析截图，默认 5 线程。"""
     cache = load_cache(date_str)
-    client = OpenAI(
-        api_key=config["api_key"],
-        base_url=config.get("base_url"),
-        timeout=60
-    )
     model = config.get("model", "gpt-4o-mini")
     sr = config.get("sample_rate", 1)
     sampled = paths[::sr]
+    max_workers = config.get("analysis_threads", 5)
 
     if verbose:
         print(f"   采样率 1/{sr}，待分析 {len(sampled)} 张")
 
-    results = []
+    results = [None] * len(sampled)
+    uncached = []
+
     for i, path in enumerate(sampled):
         ts = os.path.basename(path).replace(".jpg", "")
-
         if path in cache:
-            r = cache[path]
+            r = dict(cache[path])   # shallow copy → 不污染缓存对象
             r["time"] = ts
-            results.append(r)
+            results[i] = r
             if verbose:
                 print(f"  [{i+1}/{len(sampled)}] {ts} -> (缓存) {r['activity']}")
-            continue
+        else:
+            uncached.append((i, path))
 
-        if verbose:
-            print(f"  [{i+1}/{len(sampled)}] {ts}", end=" ", flush=True)
+    if verbose and uncached:
+        print(f"   需分析 {len(uncached)} 张，并发 {max_workers} 线程")
 
-        r = analyze_screenshot(client, model, path)
-        r["time"] = ts
-        r["path"] = path
-        results.append(r)
+    if uncached:
+        # 每线程独立 client（httpx 连接池非线程安全）
+        clients = [
+            OpenAI(api_key=config["api_key"],
+                   base_url=config.get("base_url"), timeout=60)
+            for _ in range(max_workers)
+        ]
 
-        if verbose:
-            print(f"-> {r['activity']}")
+        lock = threading.Lock()
+        completed = 0
 
-        cache[path] = r
-        if (i + 1) % 20 == 0:
-            save_cache(date_str, cache)
-        time.sleep(API_DELAY)
+        def analyze_one(idx, path):
+            nonlocal completed
+            ts = os.path.basename(path).replace(".jpg", "")
+            r = analyze_screenshot(clients[idx % max_workers], model, path)
+            r["time"] = ts
+            r["path"] = path
+            with lock:
+                cache[path] = r
+                completed += 1
+                if verbose:
+                    print(f"  [{completed}/{len(uncached)}] {ts} -> {r['activity']}")
+                if completed % 20 == 0:
+                    save_cache(date_str, cache)
+            return idx, r
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(analyze_one, idx, path) for idx, path in uncached]
+            for fut in as_completed(futures):
+                idx, r = fut.result()
+                results[idx] = r
 
     save_cache(date_str, cache)
     return results
@@ -253,6 +315,12 @@ def batch_analyze(paths, config, date_str, verbose=True):
 #  合并活动为时间段
 # =====================================================================
 
+def _dt_from_path(path, time_str):
+    """从截图路径提取完整日期 + 时间（解决跨午夜时间计算）。"""
+    folder = os.path.basename(os.path.dirname(path))
+    return datetime.strptime(f"{folder} {time_str}", "%Y-%m-%d %H-%M-%S")
+
+
 def merge_sessions(analyses):
     if not analyses:
         return []
@@ -261,28 +329,33 @@ def merge_sessions(analyses):
     cur = None
 
     def fresh(a):
+        dt = a.get("_dt")
         return {
             "start": a["time"], "end": a["time"],
+            "start_dt": dt, "end_dt": dt,
             "app": a["app"], "activity": a["activity"],
             "detail": a["detail"],
             "tags": a["tags"][:], "activity_type": a["activity_type"],
             "shot_count": 1,
-            "apps": {a["app"]}, "activities": {a["activity"]}
+            "apps": set(), "activities": set(),
         }
 
     for a in analyses:
+        a["_dt"] = _dt_from_path(a.get("path", ""), a["time"])
+
         if cur is None:
             cur = fresh(a)
+            cur["apps"].add(a["app"])
+            cur["activities"].add(a["activity"])
             continue
 
         same_type = a["activity_type"] == cur["activity_type"]
         same_app  = a["app"] == cur["app"]
-        t_cur = datetime.strptime(cur["end"], "%H-%M-%S")
-        t_a   = datetime.strptime(a["time"], "%H-%M-%S")
-        gap   = (t_a - t_cur).total_seconds() / 60
+        gap = (a["_dt"] - cur["end_dt"]).total_seconds() / 60
 
         if same_type and same_app and gap <= GAP_MINUTES:
             cur["end"] = a["time"]
+            cur["end_dt"] = a["_dt"]
             cur["shot_count"] += 1
             cur["apps"].add(a["app"])
             cur["activities"].add(a["activity"])
@@ -290,6 +363,8 @@ def merge_sessions(analyses):
         else:
             sessions.append(cur)
             cur = fresh(a)
+            cur["apps"].add(a["app"])
+            cur["activities"].add(a["activity"])
 
     if cur:
         sessions.append(cur)
@@ -299,6 +374,9 @@ def merge_sessions(analyses):
         s["activity"] = " | ".join(sorted(acts)) if len(acts) > 1 else list(acts)[0]
         apps = s["apps"]
         s["app"] = " / ".join(sorted(apps)) if len(apps) > 1 else list(apps)[0]
+        s["duration_seconds"] = max(30, int((s["end_dt"] - s["start_dt"]).total_seconds()) + 30)
+        # 清理内部临时字段
+        del s["start_dt"], s["end_dt"], s["apps"], s["activities"]
 
     return sessions
 
@@ -405,8 +483,7 @@ def generate_commentary(sessions, config):
 
     timeline = ["今日活动时间线："]
     for s in sessions:
-        dur = (datetime.strptime(s["end"], "%H-%M-%S")
-               - datetime.strptime(s["start"], "%H-%M-%S")).total_seconds() + 30
+        dur = s["duration_seconds"]
         timeline.append(f"- {s['start']}~{s['end']}（{fmt_dur(dur)}）{s['activity']}")
 
     prompt = (
@@ -445,8 +522,7 @@ def write_report(date_str, sessions, stats, chart_rel, commentary):
     lines.append("| 时间段 | 活动 | 应用 | 时长 |")
     lines.append("|--------|------|------|------|")
     for s in sessions:
-        dur = (datetime.strptime(s["end"], "%H-%M-%S")
-               - datetime.strptime(s["start"], "%H-%M-%S")).total_seconds() + 30
+        dur = s["duration_seconds"]
         e = emoji.get(s["activity_type"], "> ")
         lines.append(
             f"| {s['start']}~{s['end']} | {e} {s['activity']} "
@@ -517,8 +593,7 @@ def save_to_db(date_str, sessions, stats, commentary):
     conn.execute("DELETE FROM daily_stats WHERE date = ?", (date_str,))
 
     for s in sessions:
-        dur = (datetime.strptime(s["end"], "%H-%M-%S")
-               - datetime.strptime(s["start"], "%H-%M-%S")).total_seconds() + 30
+        dur = s["duration_seconds"]
         conn.execute("""
             INSERT INTO daily_sessions
                 (date, start_time, end_time, duration_seconds, activity, app,
@@ -548,20 +623,56 @@ def save_to_db(date_str, sessions, stats, commentary):
 
 
 # =====================================================================
-#  删除截图
+#  删除截图 + 数据清理
 # =====================================================================
 
 def ask_delete(date_str):
     ans = input("\n确认日报无误，可以删除今日截图？(y/n): ").strip().lower()
     if ans == "y":
         folder = os.path.join(SCREENSHOT_DIR, date_str)
-        if os.path.isdir(folder):
-            shutil.rmtree(folder)
-            print(f"已删除截图: {date_str}")
+        try:
+            if os.path.isdir(folder):
+                shutil.rmtree(folder, ignore_errors=True)
+                print(f"已删除截图: {date_str}")
+        except Exception as e:
+            print(f"删除截图文件夹失败: {e}")
+
         cp = _cache_path(date_str)
         if os.path.exists(cp):
-            os.remove(cp)
-            print(f"已删除分析缓存")
+            try:
+                os.remove(cp)
+                print(f"已删除分析缓存")
+            except Exception as e:
+                print(f"删除缓存文件失败: {e}")
+
+        # 清理数据库中的明细数据（隐私保护）
+        try:
+            conn = sqlite3.connect(DATABASE_PATH)
+            conn.execute(
+                "UPDATE daily_sessions SET detail='', tags='[]' WHERE date=?",
+                (date_str,)
+            )
+            conn.commit()
+            conn.close()
+            print(f"已清理数据库中的明细数据（detail/tags 已清空）")
+        except Exception as e:
+            print(f"清理数据库失败: {e}")
+
+
+def clean_old_caches():
+    """删除超过 30 天的 .cache_*.json 文件。"""
+    cutoff = time.time() - 30 * 86400
+    if not os.path.isdir(REPORT_DIR):
+        return
+    for f in os.listdir(REPORT_DIR):
+        if f.startswith(".cache_") and f.endswith(".json"):
+            p = os.path.join(REPORT_DIR, f)
+            try:
+                if os.path.getmtime(p) < cutoff:
+                    os.remove(p)
+                    print(f"   🧹 清理过期缓存: {f}")
+            except Exception:
+                pass
 
 
 # =====================================================================
@@ -569,6 +680,7 @@ def ask_delete(date_str):
 # =====================================================================
 
 def main():
+    clean_old_caches()
     config = load_config()
     target = parse_date_arg(sys.argv[1] if len(sys.argv) > 1 else None)
     ds = target.isoformat()
